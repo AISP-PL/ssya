@@ -1,5 +1,5 @@
 [project]
-name = "Template"
+name = "ssya"
 description = ""
 authors = [{ name = "AISP", email = "kontakt@aisp.pl" }]
 readme = "README.md"
@@ -85,3 +85,7 @@ markers = [
   "manual: marks tests as manual only (deselect with '-m \"not manual\"')",
   "gpu: marks tests that require GPU",
 ]
+
+
+[project.scripts]
+ssya = "ssya.main:main"
