@@ -6,7 +6,10 @@ readme = "README.md"
 requires-python = ">=3.11, <3.12"
 dynamic = ["version"]
 
-dependencies = ["dotenv>=0.9.9"]
+dependencies = [
+    "dotenv>=0.9.9",
+    "yaya-tools",
+]
 
 [dependency-groups]
 dev = [
@@ -85,6 +88,9 @@ markers = [
   "manual: marks tests as manual only (deselect with '-m \"not manual\"')",
   "gpu: marks tests that require GPU",
 ]
+
+[tool.uv.sources]
+yaya-tools = { url = "https://github.com/AISP-PL/yaya-tools/releases/download/v1.2.16/yaya_tools-1.1.0-py3-none-any.whl" }
 
 
 [project.scripts]
