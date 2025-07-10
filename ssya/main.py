@@ -1,7 +1,11 @@
 import argparse
 import logging
 
+# Launch GUI application
+from PyQt5.QtWidgets import QApplication
 from yaya_tools import __version__
+
+from ssya.gui import MainWindow
 
 logger = logging.getLogger(__name__)
 
@@ -48,12 +52,6 @@ def main() -> None:
     dataset_path = args.dataset_path
 
     # Data loading done in GUI
-
-    # Launch GUI application
-    from PyQt5.QtWidgets import QApplication
-
-    from ssya.gui import MainWindow
-
     app = QApplication([])
     window = MainWindow(dataset_path)
     window.show()
