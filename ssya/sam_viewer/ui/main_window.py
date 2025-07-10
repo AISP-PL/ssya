@@ -10,15 +10,45 @@ from PyQt5.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, 
     QLabel, QPushButton, QListWidget, QListWidgetItem,
     QSlider, QSplitter, QGroupBox, QScrollArea,
-    QMessageBox, QProgressBar, QStatusBar, QFrame
+    QMessageBox, QProgressBar, QStatusBar, QFrame,
+    QProgressDialog, QInputDialog
 )
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer
 from PyQt5.QtGui import QPixmap, QImage, QPainter, QPen
 
 from ..modules.yolo_parser import YOLOParser, YOLODetection
 from ..modules.image_navigator import ImageNavigator
+from ..modules.sam_interface import SAMInterface
+from ..modules.feature_matcher import FeatureMatcher, SimilarityResult
 
 logger = logging.getLogger(__name__)
+
+
+class FeatureExtractionWorker(QThread):
+    """Worker thread for feature extraction."""
+    
+    progress = pyqtSignal(int, int)  # current, total
+    finished = pyqtSignal(bool)  # success
+    
+    def __init__(self, feature_matcher: FeatureMatcher, image_navigator: ImageNavigator):
+        super().__init__()
+        self.feature_matcher = feature_matcher
+        self.image_navigator = image_navigator
+    
+    def run(self):
+        """Run feature extraction in background."""
+        try:
+            def progress_callback(current, total):
+                self.progress.emit(current, total)
+            
+            success = self.feature_matcher.process_dataset(
+                self.image_navigator, progress_callback
+            )
+            self.finished.emit(success)
+            
+        except Exception as e:
+            logger.error(f"Feature extraction worker failed: {e}")
+            self.finished.emit(False)
 
 
 class MainWindow(QMainWindow):
@@ -36,13 +66,21 @@ class MainWindow(QMainWindow):
         self.dataset_path = Path(dataset_path)
         self.yolo_parser: Optional[YOLOParser] = None
         self.image_navigator: Optional[ImageNavigator] = None
+        self.sam_interface: Optional[SAMInterface] = None
+        self.feature_matcher: Optional[FeatureMatcher] = None
         self.selected_detection: Optional[int] = None
+        self.similarity_results: List[SimilarityResult] = []
+        self.filtered_images: Optional[List[str]] = None
+        self.current_threshold: float = 0.7
         
         # Initialize UI
         self.init_ui()
         
         # Load dataset
         self.load_dataset()
+        
+        # Initialize SAM
+        self.init_sam()
         
         # Setup keyboard shortcuts
         self.setup_shortcuts()
@@ -171,6 +209,16 @@ class MainWindow(QMainWindow):
         
         control_layout.addWidget(sam_group)
         
+        # Similarity results group
+        results_group = QGroupBox("Similar Objects")
+        results_layout = QVBoxLayout(results_group)
+        
+        self.results_list = QListWidget()
+        self.results_list.itemClicked.connect(self.similarity_result_selected)
+        results_layout.addWidget(self.results_list)
+        
+        control_layout.addWidget(results_group)
+        
         # Progress bar
         self.progress_bar = QProgressBar()
         self.progress_bar.setVisible(False)
@@ -225,6 +273,28 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Error", error_msg)
             self.status_bar.showMessage("Failed to load dataset")
     
+    def init_sam(self):
+        """Initialize SAM interface and feature matcher."""
+        try:
+            # Initialize SAM interface
+            self.sam_interface = SAMInterface()
+            
+            # Initialize feature matcher with cache
+            cache_dir = self.dataset_path / "cache" / "features"
+            self.feature_matcher = FeatureMatcher(self.sam_interface, cache_dir)
+            
+            if self.sam_interface.is_loaded:
+                self.status_info.setText("SAM interface ready. Select a detection to begin.")
+                logger.info("SAM interface initialized successfully")
+            else:
+                self.status_info.setText("SAM interface failed to load. Feature extraction disabled.")
+                logger.warning("SAM interface failed to load")
+                
+        except Exception as e:
+            error_msg = f"Failed to initialize SAM: {e}"
+            logger.error(error_msg)
+            self.status_info.setText("SAM initialization failed.")
+    
     def update_image_display(self):
         """Update image display with current image and detections."""
         if not self.image_navigator:
@@ -232,7 +302,10 @@ class MainWindow(QMainWindow):
         
         # Update image info
         current_num, total, image_name = self.image_navigator.get_image_info()
-        self.image_info_label.setText(f"Image {current_num} of {total}: {image_name}")
+        filter_info = ""
+        if self.filtered_images is not None:
+            filter_info = f" (Filtered: {len(self.filtered_images)} images)"
+        self.image_info_label.setText(f"Image {current_num} of {total}: {image_name}{filter_info}")
         
         # Load and display image
         image = self.image_navigator.load_current_image()
@@ -242,12 +315,47 @@ class MainWindow(QMainWindow):
                 image, self.yolo_parser.classes, self.selected_detection
             )
             
+            # If we have a selected detection and SAM mask, overlay it
+            if (self.selected_detection is not None and 
+                self.feature_matcher and self.sam_interface):
+                
+                feature = self.feature_matcher.get_detection_feature(
+                    self.image_navigator.current_image_name, self.selected_detection
+                )
+                if feature and feature.mask is not None:
+                    image_with_detections = self.overlay_sam_mask(image_with_detections, feature.mask)
+            
             # Convert to Qt pixmap
             pixmap = self.cv_image_to_pixmap(image_with_detections)
             self.image_label.setPixmap(pixmap)
             self.image_label.resize(pixmap.size())
         else:
             self.image_label.setText("Failed to load image")
+    
+    def overlay_sam_mask(self, image: np.ndarray, mask: np.ndarray, alpha: float = 0.3) -> np.ndarray:
+        """
+        Overlay SAM mask on image.
+        
+        Args:
+            image: Input image (BGR format)
+            mask: Binary mask
+            alpha: Transparency factor
+            
+        Returns:
+            Image with overlaid mask
+        """
+        # Create colored mask (blue overlay)
+        colored_mask = np.zeros_like(image)
+        colored_mask[mask > 0] = [255, 100, 0]  # Orange color for mask
+        
+        # Blend with original image
+        result = cv2.addWeighted(image, 1.0, colored_mask, alpha, 0)
+        
+        # Draw mask contours
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        cv2.drawContours(result, contours, -1, (0, 255, 255), 2)  # Yellow contours
+        
+        return result
     
     def cv_image_to_pixmap(self, cv_image: np.ndarray) -> QPixmap:
         """
@@ -298,29 +406,69 @@ class MainWindow(QMainWindow):
         if not self.image_navigator:
             return
         
-        total_images = self.image_navigator.total_images
-        current_index = self.image_navigator.current_index
-        
-        self.prev_button.setEnabled(current_index > 0)
-        self.next_button.setEnabled(current_index < total_images - 1)
+        if self.filtered_images is not None:
+            # Navigation within filtered results
+            current_image = self.image_navigator.current_image_name
+            if current_image in self.filtered_images:
+                current_index = self.filtered_images.index(current_image)
+                self.prev_button.setEnabled(current_index > 0)
+                self.next_button.setEnabled(current_index < len(self.filtered_images) - 1)
+            else:
+                self.prev_button.setEnabled(False)
+                self.next_button.setEnabled(False)
+        else:
+            # Normal navigation
+            total_images = self.image_navigator.total_images
+            current_index = self.image_navigator.current_index
+            
+            self.prev_button.setEnabled(current_index > 0)
+            self.next_button.setEnabled(current_index < total_images - 1)
     
     def previous_image(self):
         """Navigate to previous image."""
-        if self.image_navigator and self.image_navigator.previous_image():
-            self.selected_detection = None
-            self.update_image_display()
-            self.update_detection_list()
-            self.update_navigation_buttons()
-            self.update_sam_controls()
+        if not self.image_navigator:
+            return
+            
+        if self.filtered_images is not None:
+            # Navigate within filtered results
+            current_image = self.image_navigator.current_image_name
+            if current_image in self.filtered_images:
+                current_index = self.filtered_images.index(current_image)
+                if current_index > 0:
+                    prev_image = self.filtered_images[current_index - 1]
+                    self.image_navigator.find_image_by_name(prev_image)
+        else:
+            # Normal navigation
+            self.image_navigator.previous_image()
+        
+        self.selected_detection = None
+        self.update_image_display()
+        self.update_detection_list()
+        self.update_navigation_buttons()
+        self.update_sam_controls()
     
     def next_image(self):
         """Navigate to next image."""
-        if self.image_navigator and self.image_navigator.next_image():
-            self.selected_detection = None
-            self.update_image_display()
-            self.update_detection_list()
-            self.update_navigation_buttons()
-            self.update_sam_controls()
+        if not self.image_navigator:
+            return
+            
+        if self.filtered_images is not None:
+            # Navigate within filtered results
+            current_image = self.image_navigator.current_image_name
+            if current_image in self.filtered_images:
+                current_index = self.filtered_images.index(current_image)
+                if current_index < len(self.filtered_images) - 1:
+                    next_image = self.filtered_images[current_index + 1]
+                    self.image_navigator.find_image_by_name(next_image)
+        else:
+            # Normal navigation
+            self.image_navigator.next_image()
+        
+        self.selected_detection = None
+        self.update_image_display()
+        self.update_detection_list()
+        self.update_navigation_buttons()
+        self.update_sam_controls()
     
     def detection_selected(self, item: QListWidgetItem):
         """Handle detection selection from list."""
@@ -383,32 +531,266 @@ class MainWindow(QMainWindow):
     def update_sam_controls(self):
         """Update SAM control button states."""
         has_selection = self.selected_detection is not None
+        has_sam = self.sam_interface and self.sam_interface.is_loaded
+        has_results = len(self.similarity_results) > 0
         
-        self.find_similar_button.setEnabled(has_selection)
-        self.name_objects_button.setEnabled(has_selection)
+        self.find_similar_button.setEnabled(has_selection and has_sam)
+        self.apply_threshold_button.setEnabled(has_results)
+        self.name_objects_button.setEnabled(has_results)
     
     def threshold_changed(self, value):
         """Handle threshold slider change."""
         threshold = value / 100.0
         self.threshold_label.setText(f"{threshold:.2f}")
+        self.current_threshold = threshold
     
     def find_similar_objects(self):
         """Find similar objects using SAM2."""
-        if self.selected_detection is None:
+        if self.selected_detection is None or not self.feature_matcher:
             return
         
-        # TODO: Implement SAM2 integration
-        self.status_info.setText("SAM2 integration coming soon...")
-        QMessageBox.information(self, "Info", "SAM2 integration will be implemented in the next phase.")
+        # Check if features have been extracted
+        if not self.feature_matcher.detection_features:
+            # Need to extract features first
+            reply = QMessageBox.question(
+                self, "Feature Extraction", 
+                "Features need to be extracted from all images first. This may take a few minutes. Continue?",
+                QMessageBox.Yes | QMessageBox.No
+            )
+            
+            if reply != QMessageBox.Yes:
+                return
+            
+            # Start feature extraction
+            self.extract_features()
+            return
+        
+        # Get reference embedding
+        current_image = self.image_navigator.current_image_name
+        reference_feature = self.feature_matcher.get_detection_feature(current_image, self.selected_detection)
+        
+        if not reference_feature:
+            # Extract feature for current detection
+            image = self.image_navigator.load_current_image()
+            detection = self.image_navigator.current_detections[self.selected_detection]
+            
+            reference_feature = self.feature_matcher.extract_detection_features(
+                image, current_image, detection, self.selected_detection
+            )
+            
+            if not reference_feature:
+                QMessageBox.warning(self, "Error", "Failed to extract features for selected detection.")
+                return
+        
+        # Find similar objects
+        self.similarity_results = self.feature_matcher.find_similar_objects(
+            reference_feature.embedding,
+            similarity_threshold=0.0,  # Show all results, filter with slider
+            max_results=100
+        )
+        
+        # Update results display
+        self.update_similarity_results()
+        
+        # Update controls
+        self.update_sam_controls()
+        
+        # Update status
+        self.status_info.setText(f"Found {len(self.similarity_results)} similar objects")
+    
+    def extract_features(self):
+        """Extract features from all detections."""
+        if not self.feature_matcher or not self.image_navigator:
+            return
+        
+        # Create progress dialog
+        progress_dialog = QProgressDialog("Extracting features...", "Cancel", 0, 100, self)
+        progress_dialog.setWindowModality(Qt.WindowModal)
+        progress_dialog.show()
+        
+        # Create worker thread
+        self.extraction_worker = FeatureExtractionWorker(self.feature_matcher, self.image_navigator)
+        self.extraction_worker.progress.connect(lambda current, total: 
+            progress_dialog.setValue(int(100 * current / total)))
+        self.extraction_worker.finished.connect(lambda success: self.feature_extraction_finished(success, progress_dialog))
+        
+        # Start extraction
+        self.extraction_worker.start()
+    
+    def feature_extraction_finished(self, success: bool, progress_dialog: QProgressDialog):
+        """Handle feature extraction completion."""
+        progress_dialog.close()
+        
+        if success:
+            stats = self.feature_matcher.get_statistics()
+            QMessageBox.information(
+                self, "Feature Extraction Complete",
+                f"Successfully extracted features from {stats['total_features']} detections "
+                f"across {stats['total_images']} images."
+            )
+            
+            # Now try finding similar objects again
+            self.find_similar_objects()
+        else:
+            QMessageBox.critical(self, "Error", "Feature extraction failed.")
+    
+    def update_similarity_results(self):
+        """Update similarity results list."""
+        self.results_list.clear()
+        
+        if not self.similarity_results:
+            return
+        
+        # Filter by threshold
+        filtered_results = [
+            result for result in self.similarity_results 
+            if result.similarity_score >= self.current_threshold
+        ]
+        
+        for result in filtered_results:
+            class_name = self.yolo_parser.get_class_name(result.detection.class_id)
+            
+            item_text = (
+                f"{result.image_name}\n"
+                f"{class_name} (Det {result.detection_index + 1})\n"
+                f"Similarity: {result.similarity_score:.3f}"
+            )
+            
+            item = QListWidgetItem(item_text)
+            item.setData(Qt.UserRole, result)
+            self.results_list.addItem(item)
+    
+    def similarity_result_selected(self, item: QListWidgetItem):
+        """Handle selection of similarity result."""
+        result = item.data(Qt.UserRole)
+        
+        # Navigate to the image
+        if self.image_navigator.find_image_by_name(result.image_name):
+            self.selected_detection = result.detection_index
+            
+            # Update displays
+            self.update_image_display()
+            self.update_detection_list()
+            self.update_navigation_buttons()
+            
+            # Select detection in list
+            self.detection_list.setCurrentRow(result.detection_index)
+            
+            # Update status
+            class_name = self.yolo_parser.get_class_name(result.detection.class_id)
+            self.status_info.setText(
+                f"Viewing similar object: {class_name} "
+                f"(Similarity: {result.similarity_score:.3f})"
+            )
     
     def apply_threshold_filter(self):
         """Apply similarity threshold filter."""
-        # TODO: Implement threshold filtering
-        self.status_info.setText("Threshold filtering coming soon...")
-        QMessageBox.information(self, "Info", "Threshold filtering will be implemented after SAM2 integration.")
+        if not self.similarity_results:
+            return
+        
+        # Get filtered results
+        filtered_results = [
+            result for result in self.similarity_results 
+            if result.similarity_score >= self.current_threshold
+        ]
+        
+        if not filtered_results:
+            QMessageBox.information(self, "No Results", "No objects match the current threshold.")
+            return
+        
+        # Extract unique image names
+        self.filtered_images = list(set(result.image_name for result in filtered_results))
+        self.filtered_images.sort()
+        
+        # Navigate to first filtered image
+        if self.filtered_images:
+            self.image_navigator.find_image_by_name(self.filtered_images[0])
+            self.selected_detection = None
+            
+            # Update displays
+            self.update_image_display()
+            self.update_detection_list()
+            self.update_navigation_buttons()
+            
+            # Update status
+            self.status_info.setText(
+                f"Filtered to {len(self.filtered_images)} images "
+                f"with {len(filtered_results)} similar objects"
+            )
+        
+        # Update similarity results display
+        self.update_similarity_results()
     
     def name_objects(self):
         """Open dialog to name object group."""
-        # TODO: Implement object naming
-        self.status_info.setText("Object naming coming soon...")
-        QMessageBox.information(self, "Info", "Object naming functionality will be implemented in the final phase.")
+        if not self.similarity_results:
+            return
+        
+        # Get current threshold filtered results
+        filtered_results = [
+            result for result in self.similarity_results 
+            if result.similarity_score >= self.current_threshold
+        ]
+        
+        if not filtered_results:
+            QMessageBox.information(self, "No Objects", "No objects match the current threshold.")
+            return
+        
+        # Ask for group name
+        name, ok = QInputDialog.getText(
+            self, "Name Object Group",
+            f"Enter name for group of {len(filtered_results)} similar objects:"
+        )
+        
+        if ok and name.strip():
+            # Save metadata
+            self.save_object_group_metadata(name.strip(), filtered_results)
+    
+    def save_object_group_metadata(self, group_name: str, results: List[SimilarityResult]):
+        """Save object group metadata to JSON file."""
+        try:
+            # Create metadata
+            metadata = {
+                "group_name": group_name,
+                "created_at": str(Path(__file__).stat().st_ctime),
+                "threshold": self.current_threshold,
+                "total_objects": len(results),
+                "objects": []
+            }
+            
+            for result in results:
+                obj_data = {
+                    "image_name": result.image_name,
+                    "detection_index": result.detection_index,
+                    "class_id": result.detection.class_id,
+                    "class_name": self.yolo_parser.get_class_name(result.detection.class_id),
+                    "bbox": {
+                        "x_center": result.detection.x_center,
+                        "y_center": result.detection.y_center,
+                        "width": result.detection.width,
+                        "height": result.detection.height
+                    },
+                    "similarity_score": result.similarity_score
+                }
+                metadata["objects"].append(obj_data)
+            
+            # Save to file
+            output_dir = self.dataset_path / "output"
+            output_dir.mkdir(exist_ok=True)
+            
+            output_file = output_dir / f"{group_name.replace(' ', '_').lower()}_group.json"
+            
+            with open(output_file, 'w') as f:
+                json.dump(metadata, f, indent=2)
+            
+            QMessageBox.information(
+                self, "Group Saved",
+                f"Object group '{group_name}' saved to:\n{output_file}"
+            )
+            
+            logger.info(f"Saved object group '{group_name}' with {len(results)} objects to {output_file}")
+            
+        except Exception as e:
+            error_msg = f"Failed to save object group: {e}"
+            logger.error(error_msg)
+            QMessageBox.critical(self, "Error", error_msg)
