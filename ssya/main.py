@@ -112,15 +112,12 @@ class MainWindow(QWidget):
             return
         det = self.dm.image_detections(self.cur_img_idx)[row]
         img = self.dm.image(self.cur_img_idx)
-        if det.embedding is None:
-            sam = Sam2Runner()
-            mask, emb = sam.mask_and_embed(img, det.bbox_pixels(img.shape[1], img.shape[0]))
-            det.embedding = emb
-        else:
-            # build fake mask for viz only
-            x, y, bw, bh = det.bbox_pixels(img.shape[1], img.shape[0])
-            mask = np.zeros(img.shape[:2], dtype=np.uint8)
-            mask[y : y + bh, x : x + bw] = 1
+
+        # Always re-run SAM2 to get the embedding
+        sam = Sam2Runner()
+        mask, emb = sam.mask_and_embed(img, det.bbox_pixels(img.shape[1], img.shape[0]))
+        det.embedding = emb
+
         self.selected_mask = [mask]
         self.viewer.show_image(
             img,
@@ -147,7 +144,7 @@ class MainWindow(QWidget):
         self.selected_detection = det
 
         thresh = self.slider.value() / 100.0
-        keep = self.dm.fidx.similar_images(det.embedding, thresh)
+        keep = self.dm.fidx.get_similar_images(det.embedding, thresh)
 
         self.files_list.clear()
         self.files_list.addItems([self.dm.images[i] for i in sorted(keep)])

@@ -7,6 +7,7 @@ from typing import Any
 
 import numpy as np
 
+from ssya.helpers.metrics import cosine_similarity
 from ssya.models.detection import Detection  # type: ignore
 
 logger = logging.getLogger(__name__)
@@ -47,9 +48,7 @@ class FeatureIndex:
 
         return cls(entries)
 
-    # ------------------------------------------------------------------
-
-    def similar_images(self, ref_emb: np.ndarray, thresh: float) -> set[int]:
+    def get_similar_images(self, ref_emb: np.ndarray, thresh: float) -> set[int]:
         """Find images with at least one detection above the threshold."""
         imgs: set[int] = set()
         for e in self.entries:

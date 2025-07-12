@@ -8,10 +8,26 @@ import cv2  # type: ignore
 import numpy as np  # type: ignore
 import requests
 import torch
+import torch.nn.functional as F
 from sam2.build_sam import build_sam2
 from sam2.sam2_image_predictor import SAM2ImagePredictor
 
 logger = logging.getLogger(__name__)
+
+
+def gem_pooling(features: torch.Tensor, mask: torch.Tensor, p: float = 3.0):
+    """
+    GeM pooling z maską: features (B, C, H, W), mask (B, 1, H, W) – bool/int.
+    Zwraca (B, C)
+    """
+    eps = 1e-6
+    masked = features * mask  # (B, C, H, W)
+    pooled = F.avg_pool2d(masked.clamp(min=eps).pow(p), kernel_size=masked.shape[-2:])  # (B, C, 1, 1)
+    pooled = pooled.pow(1.0 / p).squeeze(-1).squeeze(-1)
+    # uwzględnij liczbę aktywnych pikseli
+    denom = mask.flatten(2).sum(-1).clamp(min=1e-6)  # (B,1)
+    pooled = pooled / denom
+    return F.normalize(pooled, dim=-1)
 
 
 class Sam2Runner:
@@ -27,7 +43,8 @@ class Sam2Runner:
 
     # ------------------------------------------------------------------
 
-    def _init_model(self):
+    def _init_model(self) -> None:
+        """Initialize the SAM2 model."""
         model_path = "zoo/sam2_tiny.pth"
         if not os.path.exists(model_path):
             url = "https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_tiny.pt"
@@ -69,9 +86,6 @@ class Sam2Runner:
 
         B, C, h, w = feat_map.shape
 
-        B, C, h, w = feat_map.shape
-
-        # dopasuj maskę do rozdzielczości cech
         mask_lr = cv2.resize(mask_hr.astype(np.uint8), (w, h), interpolation=cv2.INTER_NEAREST).astype(bool)
         mask_t = torch.from_numpy(mask_lr).to(feat_map.device).view(1, 1, h, w)
 
