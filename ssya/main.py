@@ -141,9 +141,11 @@ class DatasetManager:
         self.root = root
         if not root.exists():
             raise FileNotFoundError(root)
+
         self._images_ann: dict[str, str | None] = load_directory_images_annotatations(str(root))
         self._images = list(self._images_ann.keys())
-        self._annotated = get_images_annotated(self._images_ann)
+        self._annotated: list[str] = get_images_annotated(self._images_ann)
+
         # Preload size cache to avoid repeat I/O
         self._size_cache: dict[str, tuple[int, int]] = {}
         logger.info("Dataset loaded: %d images, %d with annotations", len(self._images), len(self._annotated))
@@ -156,11 +158,13 @@ class DatasetManager:
     # ---------------------------------------------------------------------
 
     def _parse_yolo_annotations(self, img_path: str) -> list[Detection]:
+        """Parse YOLO annotations for a given image path."""
         ann_path = self._images_ann[img_path]
         if not ann_path:
             return []
+
         detections: list[Detection] = []
-        with open(ann_path, encoding="utf-8") as f:
+        with open(self.root / ann_path, encoding="utf-8") as f:
             for line in f:
                 class_id_s, xc_s, yc_s, w_s, h_s = line.strip().split()
                 detections.append(
@@ -424,6 +428,11 @@ def main() -> None:
         dataset = DatasetManager(dataset_path)
     except Exception as e:
         QMessageBox.critical(None, "Dataset load error", str(e))
+        sys.exit(1)
+
+    # Check : Dataset is empty
+    if dataset.image_count() == 0:
+        QMessageBox.warning(None, "Empty dataset", "The selected dataset contains no images.")
         sys.exit(1)
 
     win = MainWindow(dataset)
