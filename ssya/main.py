@@ -37,7 +37,6 @@ import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from shutil import copyfile
 
 import cv2  # type: ignore
 import numpy as np  # type: ignore
@@ -106,13 +105,21 @@ class Sam2Runner:
         # Check: Model not exists, download from URL to zoo
         if not os.path.exists(model_path):
             url_download = "https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_tiny.pt"
-            requests.get(url_download, allow_redirects=True)
-            copyfile(url_download, model_path)
+            # Ensure target directory exists
+            os.makedirs(os.path.dirname(model_path), exist_ok=True)
+            logger.info("Downloading SAM2 model from %s to %s", url_download, model_path)
+            resp = requests.get(url_download, allow_redirects=True)
+            resp.raise_for_status()
+            with open(model_path, "wb") as f:
+                f.write(resp.content)
 
+        # device = "cuda" if torch.cuda.is_available() else "cpu"
+        config_path = "configs/sam2.1/sam2.1_hiera_t.yaml"  # plik *.yaml
+        model = build_sam2(config_path, model_path).to("cuda").eval()
         try:
             ckpt = Path(model_path)
             logger.info("Loading SAM2 from %s", ckpt)
-            self._predictor = SAM2ImagePredictor(build_sam2(checkpoint=ckpt))
+            self._predictor = SAM2ImagePredictor(model)
             self.available = True
 
         except ModuleNotFoundError:
