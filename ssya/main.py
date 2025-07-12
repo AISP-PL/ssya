@@ -116,34 +116,36 @@ class Sam2Runner:
         # device = "cuda" if torch.cuda.is_available() else "cpu"
         config_path = "configs/sam2.1/sam2.1_hiera_t.yaml"  # plik *.yaml
         model = build_sam2(config_path, model_path).to("cuda").eval()
-        try:
-            ckpt = Path(model_path)
-            logger.info("Loading SAM2 from %s", ckpt)
-            self._predictor = SAM2ImagePredictor(model)
-            self.available = True
 
-        except ModuleNotFoundError:
-            self._predictor = None  # type: ignore
-            self.available = False
-            logger.warning("SAM2 not installed — using random vector stubs for embeddings.")
+        # SAM2ImagePredictor expects a model instance
+        ckpt = Path(model_path)
+        logger.info("Loading SAM2 from %s", ckpt)
+        self._predictor = SAM2ImagePredictor(model)
 
     def mask_and_embed(
         self, image_bgr: np.ndarray, bbox_px: tuple[int, int, int, int]
     ) -> tuple[np.ndarray, np.ndarray]:
-        """Return (mask, embedding) for given bbox in BGR image."""
-        if self.available:
-            # TODO: Provide the correct prompt format once sam2‑python is final.
-            self._predictor.set_image(image_bgr[..., ::-1])  # SAM works in RGB
-            x, y, w, h = bbox_px
-            mask, embedding = self._predictor.predict_bbox((x, y, x + w, y + h))  # type: ignore
-            return mask, embedding
-        # --- Fallback stub ----------------------------------------------------
-        h, w, _ = image_bgr.shape
-        x, y, bw, bh = bbox_px
-        mask = np.zeros((h, w), dtype=np.uint8)
-        cv2.rectangle(mask, (x, y), (x + bw, y + bh), 255, thickness=-1)
-        embedding = np.random.rand(256).astype(np.float32)  # random vector
-        return mask, embedding
+        image_rgb = image_bgr[:, :, ::-1].copy()
+        self._predictor.set_image(image_rgb)
+
+        x, y, w, h = bbox_px
+        masks, scores, logits = self._predictor.predict(
+            box=np.array([x, y, x + w, y + h]),
+            multimask_output=False,
+            return_logits=True,
+        )
+
+        mask_hr = masks[0]  # pełna rozdzielczość
+        logit_map = logits[0]  # 256×256
+
+        mask_lr = cv2.resize(
+            mask_hr.astype(np.uint8),
+            logit_map.shape[::-1],  # (W,H)
+            interpolation=cv2.INTER_NEAREST,
+        ).astype(bool)
+
+        emb = np.array([logit_map[mask_lr].mean()], dtype=np.float32)
+        return mask_hr, emb
 
 
 # -----------------------------------------------------------------------------
