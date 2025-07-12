@@ -236,6 +236,10 @@ class ImageViewer(QWidget):
         self.lbl = QLabel(alignment=Qt.AlignCenter)
         self.lbl.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.lbl.setScaledContents(True)
+        # Fixed with and height set, 1920 - 200 , 1080 - 200
+        self.lbl.setFixedWidth(1620)
+        self.lbl.setFixedHeight(880)
+
         QVBoxLayout(self).addWidget(self.lbl)
 
     def show_image(self, img_bgr: np.ndarray, dets: list[Detection], masks: list[np.ndarray]):
