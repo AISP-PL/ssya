@@ -5,14 +5,14 @@
     "version": "0.2.0",
     "configurations": [
         {
-            "name": "Python: Current File",
+            "name": "SSYA debug",
             "type": "debugpy",
             "request": "launch",
             "program": "${workspaceFolder}/ssya/main.py",
             "cwd": "${workspaceFolder}",
             "console": "integratedTerminal",
             "args": [
-                "--i",
+                "-i",
                 "${workspaceFolder}/images",
             ],
             ,
