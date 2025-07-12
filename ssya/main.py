@@ -161,10 +161,12 @@ class FeatureIndex:
     # ------------------------------------------------------------------
 
     def similar_images(self, ref_emb: np.ndarray, thresh: float) -> set[int]:
+        """Find images with at least one detection above the threshold."""
         imgs: set[int] = set()
         for e in self.entries:
             if cosine_similarity(ref_emb, e["emb"]) >= thresh:
                 imgs.add(e["image_idx"])
+
         return imgs
 
 
@@ -242,17 +244,39 @@ class ImageViewer(QWidget):
 
         QVBoxLayout(self).addWidget(self.lbl)
 
-    def show_image(self, img_bgr: np.ndarray, dets: list[Detection], masks: list[np.ndarray]):
+    def show_image(
+        self,
+        img_bgr: np.ndarray,
+        dets: list[Detection],
+        masks: list[np.ndarray],
+        selected_detection: Detection | None = None,
+        sim_threshold: float = 0.5,
+    ):
+        """Display image with detections and masks."""
         if img_bgr is None:
             return
+
         disp = img_bgr.copy()
         h, w, _ = disp.shape
+
         for m in masks:
             disp[m > 0] = (disp[m > 0] * 0.4 + np.array([255, 0, 0]) * 0.6).astype(np.uint8)
+
         for d in dets:
             x, y, bw, bh = d.bbox_pixels(w, h)
             cv2.rectangle(disp, (x, y), (x + bw, y + bh), (0, 255, 0), 2)
             cv2.putText(disp, str(d.class_id), (x, y - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 1)
+
+        if selected_detection is not None:
+            for det in dets:
+                sim = cosine_similarity(selected_detection.embedding, det.embedding)
+                x, y, bw, bh = det.bbox_pixels(w, h)
+                cv2.putText(disp, f"sim={sim:.2f}", (x, y - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 1)
+                if sim < sim_threshold:
+                    continue
+
+                cv2.rectangle(disp, (x, y), (x + bw, y + bh), (255, 0, 0), 2)
+
         rgb = cv2.cvtColor(disp, cv2.COLOR_BGR2RGB)
         qimg = QImage(rgb.data, w, h, QImage.Format_RGB888)
         self.lbl.setPixmap(QPixmap.fromImage(qimg))
@@ -304,6 +328,7 @@ class MainWindow(QWidget):
         # state --------------------------------------------------------
         self.cur_img_idx = 0
         self.selected_mask: list[np.ndarray] = []
+        self.selected_detection: Detection | None = None
 
         # signals ------------------------------------------------------
         self.files_list.currentRowChanged.connect(self.on_file_select)
@@ -315,7 +340,8 @@ class MainWindow(QWidget):
 
     # ------------------------------------------------------------------
 
-    def display_image(self, idx: int):
+    def display_image(self, idx: int) -> None:
+        """Display image and its detections."""
         self.cur_img_idx = idx
         img = self.dm.image(idx)
         dets = self.dm.image_detections(idx)
@@ -323,7 +349,7 @@ class MainWindow(QWidget):
         for i, d in enumerate(dets):
             self.dets_list.addItem(f"#{i} cls={d.class_id}")
         self.selected_mask = []
-        self.viewer.show_image(img, dets, self.selected_mask)
+        self.viewer.show_image(img, dets, self.selected_mask, selected_detection=self.selected_detection)
 
     # ------------------------------------------------------------------
 
@@ -348,23 +374,32 @@ class MainWindow(QWidget):
             mask = np.zeros(img.shape[:2], dtype=np.uint8)
             mask[y : y + bh, x : x + bw] = 1
         self.selected_mask = [mask]
-        self.viewer.show_image(img, self.dm.image_detections(self.cur_img_idx), self.selected_mask)
+        self.viewer.show_image(
+            img, self.dm.image_detections(self.cur_img_idx), self.selected_mask, selected_detection=det
+        )
 
     # ------------------------------------------------------------------
 
-    def on_find_similar(self):
+    def on_find_similar(self) -> None:
+        """Find images with at least one detection above the threshold."""
         row = self.dets_list.currentRow()
         if row < 0:
             QMessageBox.warning(self, "Select", "Select a detection first")
             return
+
         det = self.dm.image_detections(self.cur_img_idx)[row]
         if det.embedding is None:
             QMessageBox.warning(self, "No embedding", "Embedding missing – click detection again")
             return
+
+        self.selected_detection = det
+
         thresh = self.slider.value() / 100.0
         keep = self.dm.fidx.similar_images(det.embedding, thresh)
+
         self.files_list.clear()
         self.files_list.addItems([self.dm.images[i] for i in sorted(keep)])
+
         if keep:
             self.files_list.setCurrentRow(0)
 
