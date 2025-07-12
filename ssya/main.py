@@ -33,13 +33,14 @@ from __future__ import annotations
 
 import argparse
 import logging
-import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+from shutil import copyfile
 
 import cv2  # type: ignore
 import numpy as np  # type: ignore
+import requests
 from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QImage, QPixmap
 from PyQt5.QtWidgets import (
@@ -54,6 +55,7 @@ from PyQt5.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+from sam2 import SamPredictor, build_sam  # type: ignore
 
 # --- External helpers supplied by yaya_tools ---------------------------------
 from yaya_tools.helpers.dataset import (
@@ -97,14 +99,19 @@ class Sam2Runner:
     """Wraps Segment‑Anything‑Model‑2. Falls back to a fast stub if missing."""
 
     def __init__(self) -> None:
-        try:
-            # REAL import — requires sam2‑python once published
-            from sam2 import SamPredictor, build_sam  # type: ignore
+        """Initialize the SAM2 predictor if available, otherwise use a stub."""
+        model_path = "zoo/sam2_tiny.pth"  # Default model path
+        # Check: Model not exists, download from URL to zoo
+        if not os.path.exists(model_path):
+            url_download = "https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_tiny.pt"
+            requests.get(url_download, allow_redirects=True)
+            copyfile(url_download, model_path)
 
-            ckpt = os.getenv("SAM2_CKPT", "sam2_tiny.pth")
+        try:
             logger.info("Loading SAM2 from %s", ckpt)
             self._predictor = SamPredictor(build_sam(checkpoint=ckpt))
             self.available = True
+
         except ModuleNotFoundError:
             self._predictor = None  # type: ignore
             self.available = False

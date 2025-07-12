@@ -8,6 +8,7 @@ dynamic = ["version"]
 
 dependencies = [
     "dotenv>=0.9.9",
+    "sam2>=1.1.0",
     "yaya-tools",
 ]
 
