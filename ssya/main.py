@@ -241,21 +241,15 @@ class ImageViewer(QWidget):
 
     # ------------------------------------------------------------------
 
-    def set_image(
-        self,
-        img_bgr: np.ndarray,
-        detections: list[Detection],
-        masks: list[np.ndarray] | None = None,
-    ) -> None:
+    def set_image(self, img_bgr: np.ndarray, detections: list[Detection], masks: list[np.ndarray]) -> None:
         """Render image + boxes (+ masks if provided)."""
 
         display = img_bgr.copy()
         h, w, _ = display.shape
 
         # Draw masks first (semi‑transparent blue).
-        if masks:
-            for mask in masks:
-                display[mask > 0] = (display[mask > 0] * 0.4 + np.array([255, 0, 0]) * 0.6).astype(np.uint8)
+        for mask in masks:
+            display[mask > 0] = (display[mask > 0] * 0.4 + np.array([255, 0, 0]) * 0.6).astype(np.uint8)
 
         # Draw boxes (green).
         for det in detections:
@@ -331,7 +325,7 @@ class MainWindow(QWidget):
 
         # --- State ------------------------------------------------------
         self.cur_idx = 0
-        self._masks: dict[int, list[np.ndarray]] = {}  # per image idx
+        self._selected_mask: list[np.ndarray] = []  # Selected mask for the current image
 
         # --- Signals ----------------------------------------------------
         self.prev_btn.clicked.connect(lambda: self._step(-1))
@@ -345,16 +339,18 @@ class MainWindow(QWidget):
     # ------------------------------------------------------------------
 
     def _step(self, delta: int) -> None:
+        """Navigate to the next/previous image."""
+        self._selected_mask = []  # Clear selected mask on navigation
         self.cur_idx = (self.cur_idx + delta) % self.dataset.image_count()
         self._refresh()
 
     # ------------------------------------------------------------------
 
     def _refresh(self) -> None:
+        """Refresh the displayed image and detections."""
         img = self.dataset.image(self.cur_idx)
         dets = self.dataset.detections(self.cur_idx)
-        masks = self._masks.get(self.cur_idx)
-        self.viewer.set_image(img, dets, masks)
+        self.viewer.set_image(img, dets, self._selected_mask)
 
         # Update list widget
         self.det_list.clear()
@@ -365,14 +361,23 @@ class MainWindow(QWidget):
     # ------------------------------------------------------------------
 
     def _on_detection_clicked(self, row: int) -> None:
+        """Handle selection of a detection from the list."""
         if row < 0:
             return
+
+        # Detection : Get and image
         det = self.dataset.detections(self.cur_idx)[row]
         img = self.dataset.image(self.cur_idx)
+
+        # SAM2 : Compute mask and embedding
         mask, embedding = self.sam2.mask_and_embed(img, det.bbox_pixels(img.shape[1], img.shape[0]))
         det.embedding = embedding
-        self._masks.setdefault(self.cur_idx, []).append(mask)
-        self.viewer.set_image(img, self.dataset.detections(self.cur_idx), self._masks[self.cur_idx])
+
+        # Set as selected mask
+        self._selected_mask = [mask]
+
+        #
+        self.viewer.set_image(img, self.dataset.detections(self.cur_idx), self._selected_mask)
 
     # ------------------------------------------------------------------
 
