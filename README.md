@@ -1,51 +1,43 @@
-# Template : How to start and customize?
+# ssya
 
-- [ ] Create new repository from this template
-- [ ] Inside pyproject.toml rename `package_name`
-- [ ] Rename aisp_template directory to `package_name`
-- [ ] Update `README.md`
+SSYA to graficzne narzędzie do segmentacji i wyszukiwania podobnych regionów w zbiorach obrazów, wykorzystujące Segment Anything v2 (SAM2).
 
-# Template directory structure
+## Funkcje
+- Offline’owe indeksowanie i cache’owanie embeddingów z SAM2
+- Interaktywne GUI z paskami postępu i filtrowaniem według progu podobieństwa
+- Szybkie wyszukiwanie podobnych wykryć
 
-- package_name/ - Insert package code here
-- tests/ - Insert unit tests here
-- scripts/ - Insert scripts here
-- images/ - If this is CV/AI repository then insert images here
+## Wymagania
+- Python 3.11+
 
-# Package name
-
-Write package short description here.
-
-# Installation : Developer
-
-Use poetry to install the package in development mode.
-
+## Instalacja
 ```bash
-git clone {URL}
-uv sync
-uv venv
+git clone <repo-url>
+cd ssya
+pdm install
 ```
 
-# Testing   
-
-Run the tests using pytest.
-
+## Użycie
 ```bash
-uv run pytest
+ssya -i /ścieżka/do/dataset
+```
+Jeśli nie podasz `-i`, pojawi się okno dialogowe do wyboru folderu ze zbiorami.
+
+## Format danych
+Umieść w katalogu obrazy i pliki anotacji TXT (jedna linia na obiekt: `klasa xc yc szerokość wysokość`, wartości znormalizowane).
+
+## Testy
+```bash
+pdm run pytest
 ```
 
-# Release
-
-Github workflow is created to automatically release the package to PyPI when a new tag "vX.X.X" (example v1.0.0) is pushed to the main branch. 
-
+## Wydania
+Nowe tagi `vX.X.X` wrzucane na `main` są automatycznie publikowane na PyPI.  
+Możesz też ręcznie:
 ```bash
 git tag vX.X.X
 git push --tags
-```
-
-Or manually build and upload the package to PyPI using the following command.
-
-```
-uv build
+pdm build
+pdm publish
 ```
 
