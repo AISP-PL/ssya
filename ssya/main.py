@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -55,7 +56,8 @@ from PyQt5.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
-from sam2 import SamPredictor, build_sam  # type: ignore
+from sam2.build_sam import build_sam2
+from sam2.sam2_image_predictor import SAM2ImagePredictor
 
 # --- External helpers supplied by yaya_tools ---------------------------------
 from yaya_tools.helpers.dataset import (
@@ -108,8 +110,9 @@ class Sam2Runner:
             copyfile(url_download, model_path)
 
         try:
+            ckpt = Path(model_path)
             logger.info("Loading SAM2 from %s", ckpt)
-            self._predictor = SamPredictor(build_sam(checkpoint=ckpt))
+            self._predictor = SAM2ImagePredictor(build_sam2(checkpoint=ckpt))
             self.available = True
 
         except ModuleNotFoundError:
