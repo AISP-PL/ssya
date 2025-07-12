@@ -1,32 +1,21 @@
 #!/usr/bin/env python
 """
-Prototype GUI for browsing a dataset of images annotated in YOLO‑format, with basic
-integration hooks for Segment‑Anything‑Model‑2 (SAM2) to create masks & embeddings,
-plus a simple similarity search workflow.
+Improved SSYA prototype.
 
-The goal is to deliver a **single‑file** proof‑of‑concept that the team can extend.
-It deliberately keeps heavy lifting (e.g. CUDA SAM2 inference, FAISS indexing)
-behind clearly‑marked TODO stubs so the GUI remains responsive even without the
-full ML stack installed.
+Changes vs. previous version
+----------------------------
+1. **Offline feature index** — at start‑up every detection gets a SAM2
+   embedding. Index (list of dicts) is cached to *features.pickle* inside
+   the dataset directory. Re‑use if present.
+2. **tqdm progress bars** while building the index.
+3. **Two vertical lists** on the right:
+   * top → list of image filenames
+   * bottom → list of detections in currently selected image
+4. **Filtering** – "Find similar" now hides any *images* that do not
+   contain at least one detection above the threshold.
+5. **Clear filter** button resets view to full dataset.
 
-Run it either via CLI:
-    python main.py -i /path/to/dataset
-or simply:
-    python main.py
-and pick a folder from the file‑dialog.
-
-Requirements (matching the provided pyproject):
-  * Python ≥ 3.11
-  * PyQt5
-  * OpenCV‑Python
-  * NumPy (Faiss optional)
-  * yaya‑tools (already on the path via pyproject)
-  * sam2‑python (future) — optional, otherwise falls back to a stub
-
-Dataset layout expected by ``yaya_tools``:
-   images: *.jpg / *.png alongside *.txt (YOLO v5)
-
-Author: AISP / ChatGPT prototype – 2025‑07‑12
+This is still a **single file** ready to run: `python ssya_gui_rewrite.py -i /path/to/dataset`.
 """
 
 from __future__ import annotations
@@ -34,9 +23,11 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import pickle
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import cv2  # type: ignore
 import numpy as np  # type: ignore
@@ -46,44 +37,40 @@ from PyQt5.QtGui import QImage, QPixmap
 from PyQt5.QtWidgets import (
     QApplication,
     QFileDialog,
-    QHBoxLayout,
     QLabel,
     QListWidget,
     QMessageBox,
     QPushButton,
     QSizePolicy,
     QSlider,
+    QSplitter,
     QVBoxLayout,
     QWidget,
 )
 from sam2.build_sam import build_sam2
 from sam2.sam2_image_predictor import SAM2ImagePredictor
+from tqdm.auto import tqdm
 
-# --- External helpers supplied by yaya_tools ---------------------------------
+# --- External helpers from yaya_tools ---------------------------------------
 from yaya_tools.helpers.dataset import (
-    get_images_annotated,
     load_directory_images_annotatations,
 )  # type: ignore
 
-logger = logging.getLogger("ssya_gui")
+logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 
-
-# -----------------------------------------------------------------------------
-# 1. Simple datamodels
-# -----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
+# 1. Basic dataclasses
+# ----------------------------------------------------------------------------
 
 
 @dataclass
 class Detection:
-    """Single YOLO bounding‑box + (lazy) embedding placeholder."""
-
     class_id: int
-    bbox_norm: tuple[float, float, float, float]  # x_center, y_center, w, h in [0,1]
-    image_path: Path
-    embedding: np.ndarray | None = None  # computed lazily by SAM2
+    bbox_norm: tuple[float, float, float, float]
+    image_idx: int  # index in DatasetManager.images
+    embedding: np.ndarray | None = None
 
-    # Pixel bbox helper (lazily computed per resolution)
     def bbox_pixels(self, img_w: int, img_h: int) -> tuple[int, int, int, int]:
         xc, yc, w, h = self.bbox_norm
         w_px, h_px = int(w * img_w), int(h * img_h)
@@ -92,331 +79,302 @@ class Detection:
         return x1, y1, w_px, h_px
 
 
-# -----------------------------------------------------------------------------
-# 2. SAM2 minimal wrapper (stub‑friendly)
-# -----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
+# 2. SAM2 wrapper
+# ----------------------------------------------------------------------------
 
 
 class Sam2Runner:
-    """Wraps Segment‑Anything‑Model‑2. Falls back to a fast stub if missing."""
+    """Light wrapper that exposes mask + embedding for a bbox."""
 
-    def __init__(self) -> None:
-        """Initialize the SAM2 predictor if available, otherwise use a stub."""
-        model_path = "zoo/sam2_tiny.pth"  # Default model path
-        # Check: Model not exists, download from URL to zoo
+    _instance = None  # singleton for reuse
+
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+            cls._instance._init_model()
+        return cls._instance
+
+    # ------------------------------------------------------------------
+
+    def _init_model(self):
+        model_path = "zoo/sam2_tiny.pth"
         if not os.path.exists(model_path):
-            url_download = "https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_tiny.pt"
-            # Ensure target directory exists
-            os.makedirs(os.path.dirname(model_path), exist_ok=True)
-            logger.info("Downloading SAM2 model from %s to %s", url_download, model_path)
-            resp = requests.get(url_download, allow_redirects=True)
-            resp.raise_for_status()
-            with open(model_path, "wb") as f:
-                f.write(resp.content)
-
-        # device = "cuda" if torch.cuda.is_available() else "cpu"
-        config_path = "configs/sam2.1/sam2.1_hiera_t.yaml"  # plik *.yaml
-        model = build_sam2(config_path, model_path).to("cuda").eval()
-
-        # SAM2ImagePredictor expects a model instance
-        ckpt = Path(model_path)
-        logger.info("Loading SAM2 from %s", ckpt)
+            url = "https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_tiny.pt"
+            Path(model_path).parent.mkdir(parents=True, exist_ok=True)
+            logger.info("Downloading SAM2 weights …")
+            with requests.get(url, stream=True) as r, open(model_path, "wb") as f:
+                for chunk in r.iter_content(1 << 14):
+                    f.write(chunk)
+        cfg = "configs/sam2.1/sam2.1_hiera_t.yaml"
+        device = "cuda" if os.environ.get("CUDA_VISIBLE_DEVICES", "") else "cpu"
+        model = build_sam2(cfg, model_path).to(device).eval()
         self._predictor = SAM2ImagePredictor(model)
+        self.device = device
 
-    def mask_and_embed(
-        self, image_bgr: np.ndarray, bbox_px: tuple[int, int, int, int]
-    ) -> tuple[np.ndarray, np.ndarray]:
-        image_rgb = image_bgr[:, :, ::-1].copy()
-        self._predictor.set_image(image_rgb)
+    # ------------------------------------------------------------------
 
-        x, y, w, h = bbox_px
-        masks, scores, logits = self._predictor.predict(
-            box=np.array([x, y, x + w, y + h]),
+    def mask_and_embed(self, img_bgr: np.ndarray, box_px: tuple[int, int, int, int]) -> tuple[np.ndarray, np.ndarray]:
+        img_rgb = img_bgr[:, :, ::-1].copy()
+        self._predictor.set_image(img_rgb)
+        masks, _, logits = self._predictor.predict(
+            box=np.array([box_px[0], box_px[1], box_px[0] + box_px[2], box_px[1] + box_px[3]]),
             multimask_output=False,
             return_logits=True,
         )
-
-        mask_hr = masks[0]  # pełna rozdzielczość
-        logit_map = logits[0]  # 256×256
-
-        mask_lr = cv2.resize(
-            mask_hr.astype(np.uint8),
-            logit_map.shape[::-1],  # (W,H)
-            interpolation=cv2.INTER_NEAREST,
-        ).astype(bool)
-
+        mask_hr = masks[0]
+        logit_map = logits[0]
+        mask_lr = cv2.resize(mask_hr.astype(np.uint8), logit_map.shape[::-1], interpolation=cv2.INTER_NEAREST).astype(
+            bool
+        )
         emb = np.array([logit_map[mask_lr].mean()], dtype=np.float32)
         return mask_hr, emb
 
 
-# -----------------------------------------------------------------------------
-# 3. Dataset utilities
-# -----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
+# 3. Dataset + FeatureIndex
+# ----------------------------------------------------------------------------
+
+
+class FeatureIndex:
+    """Persistent RAM index: list of (image_idx, det_idx, embedding)."""
+
+    def __init__(self):
+        self.entries: list[dict[str, Any]] = []
+
+    def add(self, image_idx: int, det_idx: int, emb: np.ndarray):
+        self.entries.append({"image_idx": image_idx, "det_idx": det_idx, "emb": emb})
+
+    def save(self, path: Path):
+        with open(path, "wb") as f:
+            pickle.dump([{**e, "emb": e["emb"].astype(np.float32)} for e in self.entries], f)
+
+    @classmethod
+    def load(cls, path: Path) -> FeatureIndex:
+        with open(path, "rb") as f:
+            raw = pickle.load(f)
+        fi = cls()
+        for e in raw:
+            fi.entries.append({**e, "emb": e["emb"]})
+        return fi
+
+    # ------------------------------------------------------------------
+
+    def similar_images(self, ref_emb: np.ndarray, thresh: float) -> set[int]:
+        imgs: set[int] = set()
+        for e in self.entries:
+            if cosine_similarity(ref_emb, e["emb"]) >= thresh:
+                imgs.add(e["image_idx"])
+        return imgs
 
 
 class DatasetManager:
-    """Loads the dataset via yaya_tools and exposes detections & images."""
+    """Loads dataset, detections, builds/loads feature index."""
 
     def __init__(self, root: Path):
         self.root = root
-        if not root.exists():
-            raise FileNotFoundError(root)
+        ann_map = load_directory_images_annotatations(str(root))
+        self.images: list[str] = list(ann_map.keys())
+        self.ann_map = ann_map
+        self.detections: dict[str, list[Detection]] = {}
+        for img_idx, img_path in enumerate(self.images):
+            if not ann_map[img_path]:
+                self.detections[img_path] = []
+                continue
+            with open(root / ann_map[img_path]) as f:
+                lines = [l.split() for l in f]
+            self.detections[img_path] = [
+                Detection(int(cls), (float(xc), float(yc), float(w), float(h)), img_idx) for cls, xc, yc, w, h in lines
+            ]
+        logger.info("Dataset: %d images (%d with annotations)", len(self.images), len(self.detections))
 
-        self._images_ann: dict[str, str | None] = load_directory_images_annotatations(str(root))
-        self._images = list(self._images_ann.keys())
-        self._annotated: list[str] = get_images_annotated(self._images_ann)
+        # Build or load feature index ---------------------------------
+        self.index_path = root / "features.pickle"
+        if self.index_path.exists():
+            logger.info("Loading cached features …")
+            self.fidx = FeatureIndex.load(self.index_path)
+        else:
+            self.fidx = FeatureIndex()
+            self._build_index()
+            self.fidx.save(self.index_path)
 
-        # Preload size cache to avoid repeat I/O
-        self._size_cache: dict[str, tuple[int, int]] = {}
-        logger.info("Dataset loaded: %d images, %d with annotations", len(self._images), len(self._annotated))
+    # ------------------------------------------------------------------
 
-        # Pre‑parse detections for each annotated image
-        self._detections: dict[str, list[Detection]] = {}
-        for img_path in self._annotated:
-            self._detections[img_path] = self._parse_yolo_annotations(img_path)
+    def _build_index(self):
+        sam = Sam2Runner()
+        logger.info("Building feature index (SAM2)…")
+        for img_idx, img_path in enumerate(tqdm(self.images, desc="Images")):
+            img = cv2.imread(str(self.root / img_path))
+            if img is None:
+                continue
+            for det_idx, det in enumerate(self.detections[img_path]):
+                mask, emb = sam.mask_and_embed(img, det.bbox_pixels(img.shape[1], img.shape[0]))
+                det.embedding = emb
+                self.fidx.add(img_idx, det_idx, emb)
 
-    # ---------------------------------------------------------------------
+    # ------------------------------------------------------------------
 
-    def _parse_yolo_annotations(self, img_path: str) -> list[Detection]:
-        """Parse YOLO annotations for a given image path."""
-        ann_path = self._images_ann[img_path]
-        if not ann_path:
-            return []
-
-        detections: list[Detection] = []
-        with open(self.root / ann_path, encoding="utf-8") as f:
-            for line in f:
-                class_id_s, xc_s, yc_s, w_s, h_s = line.strip().split()
-                detections.append(
-                    Detection(
-                        class_id=int(class_id_s),
-                        bbox_norm=(float(xc_s), float(yc_s), float(w_s), float(h_s)),
-                        image_path=Path(img_path),
-                    )
-                )
-        return detections
-
-    # ---------------------------------------------------------------------
-
+    # Convenience helpers used by GUI ----------------------------------
     def image(self, idx: int) -> np.ndarray:
-        """Load an image by index. Raises ValueError if the image cannot be loaded."""
-        path = self._images[idx]
-        img = cv2.imread(self.root / path)
-        if img is None:
-            raise ValueError(f"Could not load image: {path}")
+        return cv2.imread(str(self.root / self.images[idx]))
 
-        return img
-
-    def detections(self, idx: int) -> list[Detection]:
-        path = self._images[idx]
-        return self._detections.get(path, [])
+    def image_detections(self, idx: int) -> list[Detection]:
+        return self.detections[self.images[idx]]
 
     def image_count(self) -> int:
-        return len(self._images)
+        return len(self.images)
 
 
-# -----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
 # 4. GUI widgets
-# -----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
 
 
 class ImageViewer(QWidget):
-    """Displays image with bounding boxes & optional masks."""
-
-    def __init__(self) -> None:
+    def __init__(self):
         super().__init__()
+        self.lbl = QLabel(alignment=Qt.AlignCenter)
+        self.lbl.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.lbl.setScaledContents(True)
+        QVBoxLayout(self).addWidget(self.lbl)
 
-        # QLabel przejmie całe dostępne miejsce i sam będzie skalował pixmapę
-        self.label = QLabel(alignment=Qt.AlignCenter)
-        self.label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        self.label.setScaledContents(True)  # <-- kluczowe
-        layout = QVBoxLayout(self)
-        layout.addWidget(self.label)
-
-        # Maximum width and height : Set 1920x1080 - 200
-        self.setMaximumSize(1920 - 200, 1080 - 200)
-
-        self._current_img: np.ndarray | None = None
-        self._current_masks: list[np.ndarray] = []
-
-    # ------------------------------------------------------------------
-
-    def set_image(self, img_bgr: np.ndarray, detections: list[Detection], masks: list[np.ndarray]) -> None:
-        """Render image + boxes (+ masks if provided)."""
-
-        display = img_bgr.copy()
-        h, w, _ = display.shape
-
-        # Draw masks first (semi‑transparent blue).
-        for mask in masks:
-            display[mask > 0] = (display[mask > 0] * 0.4 + np.array([255, 0, 0]) * 0.6).astype(np.uint8)
-
-        # Draw boxes (green).
-        for det in detections:
-            x, y, bw, bh = det.bbox_pixels(w, h)
-            cv2.rectangle(display, (x, y), (x + bw, y + bh), (0, 255, 0), 2)
-            cv2.putText(display, str(det.class_id), (x, y - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 1)
-
-        # Convert to Qt pixmap
-        rgb = cv2.cvtColor(display, cv2.COLOR_BGR2RGB)
+    def show_image(self, img_bgr: np.ndarray, dets: list[Detection], masks: list[np.ndarray]):
+        if img_bgr is None:
+            return
+        disp = img_bgr.copy()
+        h, w, _ = disp.shape
+        for m in masks:
+            disp[m > 0] = (disp[m > 0] * 0.4 + np.array([255, 0, 0]) * 0.6).astype(np.uint8)
+        for d in dets:
+            x, y, bw, bh = d.bbox_pixels(w, h)
+            cv2.rectangle(disp, (x, y), (x + bw, y + bh), (0, 255, 0), 2)
+            cv2.putText(disp, str(d.class_id), (x, y - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 1)
+        rgb = cv2.cvtColor(disp, cv2.COLOR_BGR2RGB)
         qimg = QImage(rgb.data, w, h, QImage.Format_RGB888)
-        self.label.setPixmap(QPixmap.fromImage(qimg))
+        self.lbl.setPixmap(QPixmap.fromImage(qimg))
 
 
-# -----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
 # 5. Main Window
-# -----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
 
 
 class MainWindow(QWidget):
-    """Top‑level application managing dataset navigation & similarity workflow."""
-
-    def __init__(self, dataset: DatasetManager):
+    def __init__(self, dm: DatasetManager):
         super().__init__()
-        self.setWindowTitle("SSYA – Similarity Search with YOLO & SAM2 (prototype)")
-        self.dataset = dataset
-        self.sam2 = Sam2Runner()
+        self.dm = dm
+        self.setWindowTitle("SSYA – embeddings cache & filtering")
 
-        # Nav controls
-        self.prev_btn = QPushButton("← Prev")
-        self.next_btn = QPushButton("Next →")
-        self.info_label = QLabel()
-
-        # Detection list
-        self.det_list = QListWidget()
-        self.det_list.setFixedWidth(180)
-
-        # Threshold slider
-        self.threshold_slider = QSlider(Qt.Horizontal)
-        self.threshold_slider.setMinimum(0)
-        self.threshold_slider.setMaximum(100)
-        self.threshold_slider.setValue(50)
-        self.threshold_slider.setTickInterval(10)
-        self.threshold_slider.setTickPosition(QSlider.TicksBelow)
-
-        # Action buttons
-        self.find_similar_btn = QPushButton("🔍  Znajdź podobne")
-        self.name_objects_btn = QPushButton("🏷️  Nazwij obiekty")
-
-        # Image viewer
+        # widgets ------------------------------------------------------
         self.viewer = ImageViewer()
 
-        # --- Layout -----------------------------------------------------
-        side_layout = QVBoxLayout()
-        side_layout.addWidget(self.det_list)
-        side_layout.addWidget(QLabel("Similarity threshold"))
-        side_layout.addWidget(self.threshold_slider)
-        side_layout.addWidget(self.find_similar_btn)
-        side_layout.addWidget(self.name_objects_btn)
-        side_layout.addStretch()
+        self.files_list = QListWidget()
+        self.files_list.addItems(dm.images)
+        self.dets_list = QListWidget()
 
-        nav_layout = QHBoxLayout()
-        nav_layout.addWidget(self.prev_btn)
-        nav_layout.addWidget(self.info_label)
-        nav_layout.addWidget(self.next_btn)
+        self.slider = QSlider(Qt.Horizontal, minimum=0, maximum=100, value=50)
+        btn_similar = QPushButton("🔍 Find similar")
+        btn_clear = QPushButton("❌ Clear filter")
 
-        main_layout = QHBoxLayout()
-        main_layout.addWidget(self.viewer)
-        main_layout.addLayout(side_layout)
+        # layout -------------------------------------------------------
+        side = QVBoxLayout()
+        side.addWidget(QLabel("Images"))
+        side.addWidget(self.files_list)
+        side.addWidget(QLabel("Detections"))
+        side.addWidget(self.dets_list)
+        side.addWidget(QLabel("Threshold"))
+        side.addWidget(self.slider)
+        side.addWidget(btn_similar)
+        side.addWidget(btn_clear)
+        side.addStretch()
 
-        root_layout = QVBoxLayout(self)
-        root_layout.addLayout(main_layout)
-        root_layout.addLayout(nav_layout)
+        splitter = QSplitter()
+        splitter.addWidget(self.viewer)
+        side_widget = QWidget()
+        side_widget.setLayout(side)
+        splitter.addWidget(side_widget)
+        splitter.setSizes([800, 300])
 
-        # --- State ------------------------------------------------------
-        self.cur_idx = 0
-        self._selected_mask: list[np.ndarray] = []  # Selected mask for the current image
+        QVBoxLayout(self).addWidget(splitter)
 
-        # --- Signals ----------------------------------------------------
-        self.prev_btn.clicked.connect(lambda: self._step(-1))
-        self.next_btn.clicked.connect(lambda: self._step(1))
-        self.det_list.currentRowChanged.connect(self._on_detection_clicked)
-        self.find_similar_btn.clicked.connect(self._find_similar)
+        # state --------------------------------------------------------
+        self.cur_img_idx = 0
+        self.selected_mask: list[np.ndarray] = []
 
-        # Init display
-        self._refresh()
+        # signals ------------------------------------------------------
+        self.files_list.currentRowChanged.connect(self.on_file_select)
+        self.dets_list.currentRowChanged.connect(self.on_det_select)
+        btn_similar.clicked.connect(self.on_find_similar)
+        btn_clear.clicked.connect(self.on_clear_filter)
 
-    # ------------------------------------------------------------------
-
-    def _step(self, delta: int) -> None:
-        """Navigate to the next/previous image."""
-        self._selected_mask = []  # Clear selected mask on navigation
-        self.cur_idx = (self.cur_idx + delta) % self.dataset.image_count()
-        self._refresh()
+        self.display_image(0)
 
     # ------------------------------------------------------------------
 
-    def _refresh(self) -> None:
-        """Refresh the displayed image and detections."""
-        img = self.dataset.image(self.cur_idx)
-        dets = self.dataset.detections(self.cur_idx)
-        self.viewer.set_image(img, dets, self._selected_mask)
-
-        # Update list widget
-        self.det_list.clear()
+    def display_image(self, idx: int):
+        self.cur_img_idx = idx
+        img = self.dm.image(idx)
+        dets = self.dm.image_detections(idx)
+        self.dets_list.clear()
         for i, d in enumerate(dets):
-            self.det_list.addItem(f"#{i}  cls={d.class_id}")
-        self.info_label.setText(f"Image {self.cur_idx + 1}/{self.dataset.image_count()}")
+            self.dets_list.addItem(f"#{i} cls={d.class_id}")
+        self.selected_mask = []
+        self.viewer.show_image(img, dets, self.selected_mask)
 
     # ------------------------------------------------------------------
 
-    def _on_detection_clicked(self, row: int) -> None:
-        """Handle selection of a detection from the list."""
+    def on_file_select(self, row: int):
+        if row >= 0:
+            self.display_image(row)
+
+    # ------------------------------------------------------------------
+
+    def on_det_select(self, row: int):
         if row < 0:
             return
-
-        # Detection : Get and image
-        det = self.dataset.detections(self.cur_idx)[row]
-        img = self.dataset.image(self.cur_idx)
-
-        # SAM2 : Compute mask and embedding
-        mask, embedding = self.sam2.mask_and_embed(img, det.bbox_pixels(img.shape[1], img.shape[0]))
-        det.embedding = embedding
-
-        # Set as selected mask
-        self._selected_mask = [mask]
-
-        #
-        self.viewer.set_image(img, self.dataset.detections(self.cur_idx), self._selected_mask)
+        det = self.dm.image_detections(self.cur_img_idx)[row]
+        img = self.dm.image(self.cur_img_idx)
+        if det.embedding is None:
+            sam = Sam2Runner()
+            mask, emb = sam.mask_and_embed(img, det.bbox_pixels(img.shape[1], img.shape[0]))
+            det.embedding = emb
+        else:
+            # build fake mask for viz only
+            x, y, bw, bh = det.bbox_pixels(img.shape[1], img.shape[0])
+            mask = np.zeros(img.shape[:2], dtype=np.uint8)
+            mask[y : y + bh, x : x + bw] = 1
+        self.selected_mask = [mask]
+        self.viewer.show_image(img, self.dm.image_detections(self.cur_img_idx), self.selected_mask)
 
     # ------------------------------------------------------------------
 
-    def _find_similar(self) -> None:
-        """Very naive similarity search across all cached embeddings."""
-        # Gather reference embedding (latest clicked)
-        ref_det: Detection | None = None
-        if self.det_list.currentRow() >= 0:
-            ref_det = self.dataset.detections(self.cur_idx)[self.det_list.currentRow()]
-        if ref_det is None or ref_det.embedding is None:
-            QMessageBox.warning(self, "Brak embeddingu", "Najpierw wybierz detekcję i wygeneruj maskę.")
+    def on_find_similar(self):
+        row = self.dets_list.currentRow()
+        if row < 0:
+            QMessageBox.warning(self, "Select", "Select a detection first")
             return
-
-        threshold = self.threshold_slider.value() / 100.0
-        similar: list[tuple[int, int, float]] = []  # (img_idx, det_idx, score)
-
-        for img_idx in range(self.dataset.image_count()):
-            for det_idx, det in enumerate(self.dataset.detections(img_idx)):
-                if det.embedding is None:
-                    continue  # skip un‑computed
-                score = cosine_similarity(ref_det.embedding, det.embedding)
-                if score >= threshold:
-                    similar.append((img_idx, det_idx, score))
-
-        similar.sort(key=lambda t: t[2], reverse=True)
-        if not similar:
-            QMessageBox.information(self, "Nic nie znaleziono", "Brak podobnych obiektów powyżej progu.")
+        det = self.dm.image_detections(self.cur_img_idx)[row]
+        if det.embedding is None:
+            QMessageBox.warning(self, "No embedding", "Embedding missing – click detection again")
             return
+        thresh = self.slider.value() / 100.0
+        keep = self.dm.fidx.similar_images(det.embedding, thresh)
+        self.files_list.clear()
+        self.files_list.addItems([self.dm.images[i] for i in sorted(keep)])
+        if keep:
+            self.files_list.setCurrentRow(0)
 
-        # Jump to first similar result (after current)
-        img_idx, det_idx, _ = similar[0]
-        self.cur_idx = img_idx
-        self._refresh()
-        self.det_list.setCurrentRow(det_idx)
+    # ------------------------------------------------------------------
+
+    def on_clear_filter(self):
+        self.files_list.clear()
+        self.files_list.addItems(self.dm.images)
+        self.files_list.setCurrentRow(self.cur_img_idx)
 
 
-# -----------------------------------------------------------------------------
-# 6. Utility functions
-# -----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
+# 6. Utils
+# ----------------------------------------------------------------------------
 
 
 def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
@@ -427,56 +385,33 @@ def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b)))
 
 
-# -----------------------------------------------------------------------------
-# 7. Entry point
-# -----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
+# 7. CLI entry
+# ----------------------------------------------------------------------------
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="SSYA dataset browser (prototype)")
-    parser.add_argument(
-        "-i",
-        "--dataset_path",
-        type=Path,
-        help="Path to the dataset root folder (images + YOLO txts).",
-    )
-    return parser.parse_args()
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("-i", "--dataset_path", type=Path)
+    args = ap.parse_args()
 
-
-def main() -> None:
-    args = parse_args()
-
-    # Qt app must be created before DatasetManager if we show a file‑dialog
     app = QApplication(sys.argv)
 
-    dataset_path: Path | None = args.dataset_path
-    if dataset_path is None:
+    ds_path = args.dataset_path
+    if ds_path is None:
         dlg = QFileDialog()
         dlg.setFileMode(QFileDialog.Directory)
-        dlg.setOption(QFileDialog.ShowDirsOnly, True)
         if dlg.exec_():
-            selected = dlg.selectedFiles()
-            if selected:
-                dataset_path = Path(selected[0])
-    if dataset_path is None:
-        logger.error("No dataset path provided. Exiting.")
-        sys.exit(1)
+            sel = dlg.selectedFiles()
+            if sel:
+                ds_path = Path(sel[0])
+    if ds_path is None:
+        sys.exit("Dataset path missing")
 
-    try:
-        dataset = DatasetManager(dataset_path)
-    except Exception as e:
-        QMessageBox.critical(None, "Dataset load error", str(e))
-        sys.exit(1)
-
-    # Check : Dataset is empty
-    if dataset.image_count() == 0:
-        QMessageBox.warning(None, "Empty dataset", "The selected dataset contains no images.")
-        sys.exit(1)
-
-    win = MainWindow(dataset)
-    win.resize(1200, 800)
+    dm = DatasetManager(ds_path)
+    win = MainWindow(dm)
+    win.resize(1400, 800)
     win.show()
-
     sys.exit(app.exec_())
 
 
