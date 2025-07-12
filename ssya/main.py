@@ -177,15 +177,19 @@ class Sam2Runner:
 class FeatureIndex:
     """Persistent RAM index: list of (image_idx, det_idx, embedding)."""
 
-    def __init__(self):
-        self.entries: list[dict[str, Any]] = []
+    def __init__(self, entries: list[dict[str, Any]] | None = None):
+        """Initialize with existing entries or empty."""
+        if entries is not None:
+            self.entries = entries
+        else:
+            self.entries: list[dict[str, Any]] = []
 
     def add(self, image_idx: int, det_idx: int, emb: np.ndarray):
         self.entries.append({"image_idx": image_idx, "det_idx": det_idx, "emb": emb})
 
     def save(self, path: Path):
         with open(path, "wb") as f:
-            pickle.dump([{**e, "emb": e["emb"].astype(np.float32)} for e in self.entries], f)
+            pickle.dump(self.entries, f, protocol=pickle.HIGHEST_PROTOCOL)
 
     def get_features(self, detections: list[Detection]) -> list[Detection]:
         """Update detections list with embeddings from the index."""
@@ -201,11 +205,9 @@ class FeatureIndex:
     @classmethod
     def load(cls, path: Path) -> FeatureIndex:
         with open(path, "rb") as f:
-            raw = pickle.load(f)
-        fi = cls()
-        for e in raw:
-            fi.entries.append({**e, "emb": e["emb"]})
-        return fi
+            entries = pickle.load(f)
+
+        return cls(entries)
 
     # ------------------------------------------------------------------
 
@@ -329,7 +331,7 @@ class ImageViewer(QWidget):
             for det in dets:
                 sim = cosine_similarity(selected_detection.embedding, det.embedding)
                 x, y, bw, bh = det.bbox_pixels(w, h)
-                cv2.putText(disp, f"sim={sim:.2f}", (x, y - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
+                cv2.putText(disp, f"{sim:.2f}", (x, y - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
                 if sim < sim_threshold:
                     continue
 
@@ -407,7 +409,13 @@ class MainWindow(QWidget):
         for i, d in enumerate(dets):
             self.dets_list.addItem(f"#{i} cls={d.class_id}")
         self.selected_mask = []
-        self.viewer.show_image(img, dets, self.selected_mask, selected_detection=self.selected_detection)
+        self.viewer.show_image(
+            img,
+            dets,
+            self.selected_mask,
+            selected_detection=self.selected_detection,
+            sim_threshold=self.slider.value() / 100.0,
+        )
 
     # ------------------------------------------------------------------
 
@@ -433,7 +441,11 @@ class MainWindow(QWidget):
             mask[y : y + bh, x : x + bw] = 1
         self.selected_mask = [mask]
         self.viewer.show_image(
-            img, self.dm.image_detections(self.cur_img_idx), self.selected_mask, selected_detection=det
+            img,
+            self.dm.image_detections(self.cur_img_idx),
+            self.selected_mask,
+            selected_detection=det,
+            sim_threshold=self.slider.value() / 100.0,
         )
 
     # ------------------------------------------------------------------
