@@ -322,7 +322,7 @@ class ImageViewer(QWidget):
 
         for d in dets:
             x, y, bw, bh = d.bbox_pixels(w, h)
-            cv2.rectangle(disp, (x, y), (x + bw, y + bh), (0, 255, 0), 2)
+            cv2.rectangle(disp, (x, y), (x + bw, y + bh), (255, 0, 0), 1)
             cv2.putText(disp, str(d.class_id), (x, y - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 1)
 
         if selected_detection is not None:
@@ -333,7 +333,7 @@ class ImageViewer(QWidget):
                 if sim < sim_threshold:
                     continue
 
-                cv2.rectangle(disp, (x, y), (x + bw, y + bh), (255, 0, 0), thickness=2)
+                cv2.rectangle(disp, (x, y), (x + bw, y + bh), (0, 255, 0), thickness=2)
 
         rgb = cv2.cvtColor(disp, cv2.COLOR_BGR2RGB)
         qimg = QImage(rgb.data, w, h, QImage.Format_RGB888)
