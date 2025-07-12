@@ -179,10 +179,12 @@ class DatasetManager:
     # ---------------------------------------------------------------------
 
     def image(self, idx: int) -> np.ndarray:
+        """Load an image by index. Raises ValueError if the image cannot be loaded."""
         path = self._images[idx]
-        img = cv2.imread(path)
+        img = cv2.imread(self.root / path)
         if img is None:
             raise ValueError(f"Could not load image: {path}")
+
         return img
 
     def detections(self, idx: int) -> list[Detection]:
