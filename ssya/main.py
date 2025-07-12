@@ -149,6 +149,17 @@ class FeatureIndex:
         with open(path, "wb") as f:
             pickle.dump([{**e, "emb": e["emb"].astype(np.float32)} for e in self.entries], f)
 
+    def get_features(self, detections: list[Detection]) -> list[Detection]:
+        """Update detections list with embeddings from the index."""
+        for det in detections:
+            if det.embedding is None:
+                for e in self.entries:
+                    if e["image_idx"] == det.image_idx and e["det_idx"] == det.class_id:
+                        det.embedding = e["emb"]
+                        break
+
+        return detections
+
     @classmethod
     def load(cls, path: Path) -> FeatureIndex:
         with open(path, "rb") as f:
@@ -200,6 +211,10 @@ class DatasetManager:
             self._build_index()
             self.fidx.save(self.index_path)
 
+        # Detections : Update with embeddings from the index
+        for img_path, dets in self.detections.items():
+            self.detections[img_path] = self.fidx.get_features(dets)
+
     # ------------------------------------------------------------------
 
     def _build_index(self):
@@ -218,12 +233,15 @@ class DatasetManager:
 
     # Convenience helpers used by GUI ----------------------------------
     def image(self, idx: int) -> np.ndarray:
+        """Get image at index `idx`."""
         return cv2.imread(str(self.root / self.images[idx]))
 
     def image_detections(self, idx: int) -> list[Detection]:
+        """Get detections for the image at index `idx`."""
         return self.detections[self.images[idx]]
 
     def image_count(self) -> int:
+        """Get the number of images in the dataset."""
         return len(self.images)
 
 
@@ -233,6 +251,8 @@ class DatasetManager:
 
 
 class ImageViewer(QWidget):
+    """Widget to display images with detections and masks."""
+
     def __init__(self):
         super().__init__()
         self.lbl = QLabel(alignment=Qt.AlignCenter)
