@@ -51,6 +51,7 @@ from PyQt5.QtWidgets import (
     QListWidget,
     QMessageBox,
     QPushButton,
+    QSizePolicy,
     QSlider,
     QVBoxLayout,
     QWidget,
@@ -224,19 +225,30 @@ class ImageViewer(QWidget):
 
     def __init__(self) -> None:
         super().__init__()
+
+        # QLabel przejmie całe dostępne miejsce i sam będzie skalował pixmapę
         self.label = QLabel(alignment=Qt.AlignCenter)
+        self.label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.label.setScaledContents(True)  # <-- kluczowe
         layout = QVBoxLayout(self)
         layout.addWidget(self.label)
+
+        # Maximum width and height : Set 1920x1080 - 200
+        self.setMaximumSize(1920 - 200, 1080 - 200)
+
         self._current_img: np.ndarray | None = None
         self._current_masks: list[np.ndarray] = []
 
     # ------------------------------------------------------------------
 
     def set_image(
-        self, img_bgr: np.ndarray, detections: list[Detection], masks: list[np.ndarray] | None = None
+        self,
+        img_bgr: np.ndarray,
+        detections: list[Detection],
+        masks: list[np.ndarray] | None = None,
     ) -> None:
         """Render image + boxes (+ masks if provided)."""
-        self._current_img = img_bgr.copy()
+
         display = img_bgr.copy()
         h, w, _ = display.shape
 
@@ -253,7 +265,7 @@ class ImageViewer(QWidget):
 
         # Convert to Qt pixmap
         rgb = cv2.cvtColor(display, cv2.COLOR_BGR2RGB)
-        qimg = QImage(rgb.data, rgb.shape[1], rgb.shape[0], QImage.Format_RGB888)
+        qimg = QImage(rgb.data, w, h, QImage.Format_RGB888)
         self.label.setPixmap(QPixmap.fromImage(qimg))
 
 
