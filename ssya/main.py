@@ -255,7 +255,7 @@ class DatasetManager:
 
     # ------------------------------------------------------------------
 
-    def _build_index(self):
+    def _build_index(self) -> None:
         sam = Sam2Runner()
         logger.info("Building feature index (SAM2)…")
         for img_idx, img_path in enumerate(tqdm(self.images, desc="Images")):
@@ -329,11 +329,11 @@ class ImageViewer(QWidget):
             for det in dets:
                 sim = cosine_similarity(selected_detection.embedding, det.embedding)
                 x, y, bw, bh = det.bbox_pixels(w, h)
-                cv2.putText(disp, f"sim={sim:.2f}", (x, y - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 1)
+                cv2.putText(disp, f"sim={sim:.2f}", (x, y - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
                 if sim < sim_threshold:
                     continue
 
-                cv2.rectangle(disp, (x, y), (x + bw, y + bh), (255, 0, 0), 2)
+                cv2.rectangle(disp, (x, y), (x + bw, y + bh), (255, 0, 0), thickness=2)
 
         rgb = cv2.cvtColor(disp, cv2.COLOR_BGR2RGB)
         qimg = QImage(rgb.data, w, h, QImage.Format_RGB888)
